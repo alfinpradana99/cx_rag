@@ -1,9 +1,9 @@
-import streamlit as st
-
-from google import genai
-from google.genai import types
-from pinecone import Pinecone
 import ast
+import requests
+import streamlit as st
+from google import genai
+from pinecone import Pinecone
+from google.genai import types
 from typing import List, Dict, Tuple, Optional
 
 # Page configuration
@@ -13,32 +13,15 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize session state for API keys and prompts
+# Initialize session state for API keys only
 if 'api_keys_set' not in st.session_state:
     st.session_state.api_keys_set = False
 
-# Product ingredients dictionary
-product_ingredients = {
-    "Joint Care": {
-        "active_ingredients": ["Glucosamine", "Chondroitin", "MSM", "Omega-3"],
-        "supporting_ingredients": ["Vitamin C", "Vitamin E", "Turmeric"]
-    },
-    "Anti-itch": {
-        "active_ingredients": ["Quercetin", "Omega-3", "Probiotics"],
-        "supporting_ingredients": ["Biotin", "Zinc", "Vitamin A"]
-    },
-    "Calming": {
-        "active_ingredients": ["L-Theanine", "Chamomile", "Valerian Root"],
-        "supporting_ingredients": ["Melatonin", "Tryptophan", "B-Complex"]
-    },
-    "Probiotics": {
-        "active_ingredients": ["Lactobacillus", "Bifidobacterium", "Enterococcus"],
-        "supporting_ingredients": ["Prebiotics", "Digestive Enzymes"]
-    },
-    "Croquettes au poulet frais": {
-        "active_ingredients": ["Fresh Chicken", "Rice", "Vegetables"],
-        "supporting_ingredients": ["Vitamins", "Minerals", "Antioxidants"]
-    }
+product_sku_mapping = {
+    "Joint Care": "CJF",
+    "Anti-itch": "CSI",
+    "Calming": "CSR",
+    "Probiotics": "CSD"
 }
 
 # Default prompt templates
@@ -48,10 +31,19 @@ Please provide a response to the customer's original question based on the Q&A c
 DEFAULT_INSTRUCTIONS_PROMPT = """Instructions:
 - Respond in the same language as the customer's original question. Regardless of the language of the Q&A context.
 - Use the relevant Q&A context to understand how to address customer's question
-- Be concise and professional; follow the tone used in templates and previous answers
-- Stay as close as possible to the provided Q&A context. Be helpful, professional, and empathetic.
+- Maintain a consistent and professional tone by closely following the style, tone, and structure of past answers and templates.
+- Always prioritize relevance to the provided Q&A context and show empathy.
+- Respond concisely in one paragraph if possible.
+- When referring to the product, use pronouns (it, this, these) instead of repeating the product name.
 - Do not make up information or speculate—only answer based on the context and ingredients provided.
-- If no relevant answer can be inferred, say so politely and suggest the customer contact our support team."""
+- If no relevant answer can be inferred, say so politely and suggest the customer contact our support team.
+- NOTE: The contexts are ordered by relevance (cosine similarity score). The earlier contexts are more relevant and should be given more weight in your response.
+"""
+
+# Fixed values (no longer editable by users)
+FIXED_TOP_K = 10
+FIXED_GROUND_TRUTH_THRESHOLD = 0.85
+FIXED_ORGANIC_THRESHOLD = 0.85
 
 # Initialize session state for prompts
 if 'beginning_prompt' not in st.session_state:
@@ -82,6 +74,40 @@ def get_embedding(client, text: str, n_dims: int) -> List[float]:
     )
     return result.embeddings[0].values
 
+def get_product_by_sku(sku):
+    url = "http://cms.balto.fr/api/graphql"
+    headers = {
+        "Authorization": "users API-Key 8b4a64b7-8de6-4f23-8025-4b0340951e3a",
+        "Content-Type": "application/json"
+    }
+    query = """
+    query baltoProducts($skus: [String]) {
+      ProductIngredientsAiRags(limit: 100, where: { sku: { in: $skus } }) {
+        limit
+        totalDocs
+        docs {
+          sku
+          generalInstructions
+          dosageGuidelines
+          ingredients {
+            name
+            value
+          }
+        }
+      }
+    }
+    """
+    variables = {
+        "skus": [sku]
+    }
+
+    response = requests.post(url, headers=headers, json={"query": query, "variables": variables})
+
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"Query failed with status code {response.status_code}: {response.text}")
+
 def retrieve_from_namespace(
     index,
     embedding: List[float],
@@ -89,7 +115,7 @@ def retrieve_from_namespace(
     product_name: Optional[str] = None,
     question_type: str = "general",
     top_k: int = 10,
-    score_threshold: float = 0.9
+    score_threshold: float = 0.85
 ) -> List[Dict]:
     """Retrieve relevant QnA pairs from a specific namespace."""
     
@@ -146,8 +172,47 @@ def combine_results(
     return combined[:max_results]
 
 def get_product_ingredients(product_name: str) -> Optional[Dict]:
-    """Get ingredients for a specific product."""
-    return product_ingredients.get(product_name, None)
+    """Get ingredients for a specific product from API."""
+    # Get SKU from product name
+    sku = product_sku_mapping.get(product_name)
+    if not sku:
+        return None
+    
+    try:
+        # Call API
+        api_response = get_product_by_sku(sku)
+        
+        # Extract product data
+        docs = api_response.get('data', {}).get('ProductIngredientsAiRags', {}).get('docs', [])
+        if not docs:
+            return None
+        
+        product_data = docs[0]  # Get first matching product
+        
+        # Format ingredients with their values
+        ingredients = product_data.get('ingredients', [])
+        
+        # Create formatted ingredient list with names and values
+        formatted_ingredients = []
+        for ingredient in ingredients:
+            ingredient_name = ingredient.get('name', '')
+            ingredient_value = ingredient.get('value', '')
+            if ingredient_name and ingredient_value:
+                formatted_ingredients.append(f"{ingredient_name} ({ingredient_value})")
+            elif ingredient_name:
+                formatted_ingredients.append(ingredient_name)
+        
+        return {
+            "ingredients": formatted_ingredients,
+            "general_instructions": product_data.get('generalInstructions', ''),
+            "dosage_guidelines": product_data.get('dosageGuidelines', ''),
+            "raw_ingredients": ingredients,  # Keep raw data for reference
+            "sku": product_data.get('sku', '')
+        }
+        
+    except Exception as e:
+        st.error(f"Failed to fetch product ingredients: {str(e)}")
+        return None
 
 def construct_prompt(
     user_question: str,
@@ -169,23 +234,36 @@ Question Type: {question_type}
     if product_name:
         prompt += f"Product Name: {product_name}\n"
         
-    prompt += "\nRelevant Q&A Context:"
+    prompt += "\nRelevant Q&A Context (ordered by relevance - higher cosine similarity scores indicate more relevant contexts):"
     for i, qa in enumerate(qa_context, 1):
         prompt += f"\n{i}. Similar Question: {qa['question']}"
         prompt += f"\n   Answer: {qa['answer']}"
         prompt += f"\n   Product: {qa['product_name']}"
+        prompt += f"\n   Cosine Similarity Score: {qa['score']:.3f}"
 
     if ingredients:
-        prompt += f"\nHere is the composition of this product:\n"
-        prompt += f"Active Ingredients: {', '.join(ingredients.get('active_ingredients', []))}\n"
-        prompt += f"Supporting Ingredients: {', '.join(ingredients.get('supporting_ingredients', []))}\n"
+        prompt += f"\n\nProduct Information for {product_name}:\n"
+        
+        # Show ingredients with values
+        if ingredients.get('ingredients'):
+            prompt += f"\nIngredients:\n"
+            for ingredient in ingredients.get('ingredients', []):
+                prompt += f"- {ingredient}\n"
+        
+        # Show general instructions if available
+        if ingredients.get('general_instructions'):
+            prompt += f"\nGeneral Instructions: {ingredients.get('general_instructions')}\n"
+        
+        # Show dosage guidelines if available
+        if ingredients.get('dosage_guidelines'):
+            prompt += f"\nDosage Guidelines:\n{ingredients.get('dosage_guidelines')}\n"
 
-    prompt += f"\n\n{instructions_prompt}\n"
+    prompt += f"\n\n{instructions_prompt}"
 
     if ingredients:
-        prompt += "- Use Product composition as a source to help answer the customer's question where relevant.\n"
-
-    prompt += f"\nYour Response:"
+        prompt += "- Use product information (ingredients, instructions, dosage) to support the response only where relevant. Do not list all ingredients—mention only those specifically asked about by the customer."
+                
+    prompt += f"\n\nYour Response:"
 
     return prompt
 
@@ -195,7 +273,7 @@ def generate_response(client, prompt: str) -> str:
         model="gemini-2.5-flash-preview-05-20",
         contents=prompt,
         config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=0)
+            thinking_config=types.ThinkingConfig(thinking_budget=8192) # can use 0 to 24576, 0 means disable thinking # 1024,2048, 4096, 8192, 16384
         )
     )
     return response.text
@@ -206,12 +284,7 @@ def rag_pipeline(
     user_query: str,
     product_name: Optional[str] = None,
     question_type: str = "general",
-    need_ingredients: bool = False,
-    top_k: int = 10,
-    ground_truth_threshold: float = 0.84,
-    organic_threshold: float = 0.80,
-    beginning_prompt: str = DEFAULT_BEGINNING_PROMPT,
-    instructions_prompt: str = DEFAULT_INSTRUCTIONS_PROMPT
+    need_ingredients: bool = False
 ) -> Dict:
     """Complete RAG pipeline for customer service response generation."""
     # Fixed embedding dimensions
@@ -226,25 +299,25 @@ def rag_pipeline(
         namespace="ground-truth",
         product_name=product_name,
         question_type=question_type,
-        top_k=top_k,
-        score_threshold=ground_truth_threshold
+        top_k=FIXED_TOP_K,
+        score_threshold=FIXED_GROUND_TRUTH_THRESHOLD
     )
     
     # Step 4: If needed, retrieve from organic namespace
     organic_results = []
-    if len(ground_truth_results) < top_k:
+    if len(ground_truth_results) < FIXED_TOP_K:
         organic_results = retrieve_from_namespace(
             index=index,
             embedding=embedding,
             namespace=None,  # Default namespace
             product_name=product_name,
             question_type=question_type,
-            top_k=top_k,
-            score_threshold=organic_threshold
+            top_k=FIXED_TOP_K,
+            score_threshold=FIXED_ORGANIC_THRESHOLD
         )
     
     # Step 5: Combine results
-    combined_results = combine_results(ground_truth_results, organic_results, max_results=top_k)
+    combined_results = combine_results(ground_truth_results, organic_results, max_results=FIXED_TOP_K)
     
     # Step 6: Get ingredients if needed
     ingredients = None
@@ -258,8 +331,8 @@ def rag_pipeline(
         qa_context=combined_results,
         product_name=product_name,
         ingredients=ingredients,
-        beginning_prompt=beginning_prompt,
-        instructions_prompt=instructions_prompt
+        beginning_prompt=DEFAULT_BEGINNING_PROMPT,  # Always use default
+        instructions_prompt=DEFAULT_INSTRUCTIONS_PROMPT  # Always use default
     )
     
     response = generate_response(client, prompt)
@@ -274,15 +347,15 @@ def rag_pipeline(
         "response": response,
         "ground_truth_count": len(ground_truth_results),
         "organic_count": len(organic_results),
-        "ground_truth_threshold": ground_truth_threshold,
-        "organic_threshold": organic_threshold
+        "ground_truth_threshold": FIXED_GROUND_TRUTH_THRESHOLD,
+        "organic_threshold": FIXED_ORGANIC_THRESHOLD
     }
 
 # Main app
 st.title("🐕 Balto Customer Service RAG Demo")
 st.markdown("This demo showcases the RAG pipeline for generating customer service responses.")
 
-# Sidebar for API keys and configuration
+# Sidebar for API keys only
 with st.sidebar:
     st.header("⚙️ Configuration")
     
@@ -300,13 +373,6 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.error("Please provide both API keys")
-    
-    # Advanced settings
-    st.header("🎛️ Advanced Settings")
-    top_k = st.slider("Top K Results", min_value=1, max_value=20, value=10)
-    st.subheader("Score Thresholds")
-    ground_truth_threshold = st.slider("Ground Truth Threshold", min_value=0.0, max_value=1.0, value=0.84, step=0.01)
-    organic_threshold = st.slider("Organic Threshold", min_value=0.0, max_value=1.0, value=0.80, step=0.01)
 
 # Main content
 if st.session_state.api_keys_set:
@@ -335,69 +401,24 @@ if st.session_state.api_keys_set:
     with col2:
         product_name = st.selectbox(
             "Product Name",
-            options=[None] + list(product_ingredients.keys()),
+            options=[None] + list(product_sku_mapping.keys()),
             index=1
         )
         
         need_ingredients = st.checkbox("Include Product Ingredients", value=True)
     
-    # Prompt Customization Section
-    st.header("📝 Prompt Customization")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Beginning Prompt")
-        beginning_prompt = st.text_area(
-            "Customize the beginning of the prompt:",
-            value=st.session_state.beginning_prompt,
-            height=120,
-            help="This sets the role and initial context for the AI agent.",
-            key="beginning_prompt_input"
-        )
-        # Update session state when text changes
-        st.session_state.beginning_prompt = beginning_prompt
-    
-    with col2:
-        st.subheader("Instructions Prompt")
-        instructions_prompt = st.text_area(
-            "Customize the instructions section:",
-            value=st.session_state.instructions_prompt,
-            height=120,
-            help="These are the specific instructions for how the AI should respond.",
-            key="instructions_prompt_input"
-        )
-        # Update session state when text changes
-        st.session_state.instructions_prompt = instructions_prompt
-    
-    # Reset buttons
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        if st.button("🔄 Reset Beginning"):
-            st.session_state.beginning_prompt = DEFAULT_BEGINNING_PROMPT
-            st.rerun()
-    with col2:
-        if st.button("🔄 Reset Instructions"):
-            st.session_state.instructions_prompt = DEFAULT_INSTRUCTIONS_PROMPT
-            st.rerun()
-    
     # Process button
     if st.button("🚀 Generate Response", type="primary"):
         with st.spinner("Processing..."):
             try:
-                # Run the pipeline
+                # Run the pipeline with fixed parameters
                 result = rag_pipeline(
                     client=client,
                     index=index,
                     user_query=user_query,
                     product_name=product_name,
                     question_type=question_type,
-                    need_ingredients=need_ingredients,
-                    top_k=top_k,
-                    ground_truth_threshold=ground_truth_threshold,
-                    organic_threshold=organic_threshold,
-                    beginning_prompt=beginning_prompt,
-                    instructions_prompt=instructions_prompt
+                    need_ingredients=need_ingredients
                 )
                 
                 # Display results
@@ -440,8 +461,9 @@ if st.session_state.api_keys_set:
                         "ingredients_used": result['ingredients_used'],
                         "total_contexts": len(result['retrieved_contexts']),
                         "embedding_dimensions": 768,  # Fixed value
-                        "ground_truth_threshold": result['ground_truth_threshold'],
-                        "organic_threshold": result['organic_threshold']
+                        "top_k": FIXED_TOP_K,
+                        "ground_truth_threshold": FIXED_GROUND_TRUTH_THRESHOLD,
+                        "organic_threshold": FIXED_ORGANIC_THRESHOLD
                     })
                     
             except Exception as e:
