@@ -29,15 +29,13 @@ DEFAULT_BEGINNING_PROMPT = """You are a helpful CX agent for Balto, a premium do
 Please provide a response to the customer's original question based on the Q&A context provided."""
 
 DEFAULT_INSTRUCTIONS_PROMPT = """Instructions:
-- Respond in the same language as the customer's original question. Regardless of the language of the Q&A context.
-- Use the relevant Q&A context to understand how to address customer's question
-- Maintain a consistent and professional tone by closely following the style, tone, and structure of past answers and templates.
-- Always prioritize relevance to the provided Q&A context and show empathy.
-- Respond concisely in one paragraph if possible.
-- When referring to the product, use pronouns (it, this, these) instead of repeating the product name.
-- Do not make up information or speculate—only answer based on the context and ingredients provided.
-- If no relevant answer can be inferred, say so politely and suggest the customer contact our support team.
-- NOTE: The contexts are ordered by relevance (cosine similarity score). The earlier contexts are more relevant and should be given more weight in your response.
+- Respond in the same language as the customer's original question, regardless of the language used in the Q&A context.
+- Answer based strictly on the most relevant Q&A context and product information provided. Do not invent or speculate.
+- Maintain a consistent, professional tone aligned with previous responses. Show empathy where appropriate.
+- Keep the response concise—ideally one paragraph.
+- Use pronouns (it, this, these) when referring to the product, not its full name.
+- If no relevant answer can be inferred, respond politely and suggest contacting our support team.
+- Note: Contexts are ranked by relevance (cosine similarity). Prioritize earlier entries when forming your response.
 """
 
 # Fixed values (no longer editable by users)
@@ -273,6 +271,7 @@ def generate_response(client, prompt: str) -> str:
         model="gemini-2.5-flash-preview-05-20",
         contents=prompt,
         config=types.GenerateContentConfig(
+            temperature=0.0,
             thinking_config=types.ThinkingConfig(thinking_budget=8192) # can use 0 to 24576, 0 means disable thinking # 1024,2048, 4096, 8192, 16384
         )
     )
